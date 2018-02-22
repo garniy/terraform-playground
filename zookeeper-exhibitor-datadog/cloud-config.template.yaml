@@ -1,0 +1,118 @@
+#cloud-config
+hostname: ${node_name}
+
+coreos:
+  units:
+  - name: exhibitor.service
+    command: start
+    content: |
+      [Unit]
+      Requires=docker.service
+      After=docker.service
+      RequiresMountsFor=/var/lib/efs
+
+      [Service]
+      TimeoutSec=0
+      Restart=on-failure
+      RestartSec=30s
+
+      ExecStartPre=/usr/bin/mkdir -p \
+        /var/lib/zookeeper/snapshots \
+        /var/lib/zookeeper/transactions
+      ExecStartPre=-/usr/bin/docker rm -f exhibitor
+      ExecStartPre=/usr/bin/docker pull ${docker_image}
+
+      ExecStart=/usr/bin/docker run --rm \
+        --name exhibitor \
+        --log-driver journald \
+        --publish 2181:2181 \
+        --publish 2888:2888 \
+        --publish 3888:3888 \
+        --publish 8081:8081 \
+        --volume /etc/exhibitor:/etc/exhibitor \
+        --volume /var/lib/efs:/var/lib/exhibitor \
+        --volume /var/lib/zookeeper:/var/lib/zookeeper \
+        ${docker_image} \
+          --hostname $private_ipv4 \
+          --port 8081 \
+          --jquerystyle ${exhibitor_style} \
+          --defaultconfig /etc/exhibitor/default.properties \
+          --configtype file --fsconfigdir /var/lib/exhibitor
+
+      ExecStop=-/usr/bin/docker stop exhibitor
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - name: redirect.service
+    command: start
+    content: |
+      [Unit]
+      Requires=docker.service
+      After=docker.service
+
+      [Service]
+      Restart=always
+      RestartSec=15s
+
+      ExecStartPre=-/usr/bin/docker rm -f redirect
+      ExecStartPre=-/usr/bin/docker pull cusspvz/redirect
+      ExecStart=/usr/bin/docker run --rm \
+        --name=redirect \
+        --log-driver journald \
+        --publish 8080:80 \
+        cusspvz/redirect
+
+  - name: dd-agent.service
+    command: start
+    content: |
+      [Unit]
+      Description=Datadog agent
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      TimeoutStartSec=0
+      ExecStartPre=-/usr/bin/docker kill dd-agent
+      ExecStartPre=-/usr/bin/docker rm dd-agent
+      ExecStartPre=/usr/bin/docker pull datadog/docker-dd-agent
+      ExecStart=/bin/bash -c '/usr/bin/docker run -d --name dd-agent -h `hostname` -v /var/run/docker.sock:/var/run/docker.sock -v /proc/:/host/proc/:ro -v /sys/fs/cgroup/:/host/sys/fs/cgroup:ro -e API_KEY=${datadog_api_key} datadog/docker-dd-agent:latest'
+      ExecStop=/usr/bin/docker stop dd-agent
+
+      [X-Fleet]
+      Global=true
+
+write_files:
+- path: /etc/environment
+  content: |
+    COREOS_PRIVATE_IPV4=$private_ipv4
+    NODE_NAME=${node_name}
+    NODE_TYPE=exhibitor
+    DATADOG_API_KEY=${datadog_api_key}
+
+- path: /etc/exhibitor/default.properties
+  content: |
+    zookeeper-install-directory=/usr/zookeeper
+    zookeeper-data-directory=/var/lib/zookeeper/snapshots
+    zookeeper-log-directory=/var/lib/zookeeper/transactions
+    log-index-directory=/var/lib/zookeeper/transactions
+    cleanup-period-ms=300000
+    observer-threshold=0
+    check-ms=30000
+    client-port=2181
+    connect-port=2888
+    election-port=3888
+    zoo-cfg-extra=tickTime\=2000&initLimit\=10&syncLimit\=5&quorumListenOnAllIPs\=true
+    auto-manage-instances=1
+    auto-manage-instances-settling-period-ms=0
+    auto-manage-instances-fixed-ensemble-size=1
+
+
+- path: /etc/dd-agent/conf.d/zk.yaml
+  content: |
+    init_config:
+
+    instances:
+    - host: $private_ipv4
+      port: 2181
+      timeout: 5
